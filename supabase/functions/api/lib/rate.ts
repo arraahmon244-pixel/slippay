@@ -1,77 +1,83 @@
-let cache: { value: number; expires: number } | null = null;
-let inflightPromise: Promise<number> | null = null;
-const TTL_MS = 60_000;
-const FALLBACK_RATE = 5.00; // Sane fallback rate if upstream is entirely down
+const COINGECKO_URL = 'https://api.coingecko.com/api/v3/simple/price?ids=usd-coin&vs_currencies=brl';
+export const DEFAULT_FALLBACK_BRL_PER_USDC = 5.4;
 
-export function _resetCacheForTest() { 
-  cache = null; 
-  inflightPromise = null;
+interface CachedRate {
+  rate: number;
+  timestamp: number;
+  stale: boolean;
 }
 
-export async function getBrlPerUsdc(): Promise<number> {
-  // Allow a fixed override in tests/CI to avoid hitting CoinGecko.
-  const override = Deno.env.get("RATE_BRL_USDC");
-  if (override) {
-    const v = parseFloat(override);
-    if (v > 0) return v;
+let inFlightPromise: Promise<number> | null = null;
+let lastKnownRate: CachedRate | null = null;
+const CACHE_TTL_MS = 60_000; // 60s cache
+
+async function fetchWithTimeout(url: string, timeoutMs = 5000): Promise<Response> {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, { signal: controller.signal });
+    return response;
+  } finally {
+    clearTimeout(id);
   }
+}
+
+async function fetchCoinGeckoWithRetry(retries = 2, delayMs = 300): Promise<number> {
+  let attempt = 0;
+  while (attempt <= retries) {
+    try {
+      const res = await fetchWithTimeout(COINGECKO_URL, 5000);
+      if (!res.ok) {
+        throw new Error(`Upstream returned status ${res.status}`);
+      }
+      const data = await res.json();
+      const rate = data?.['usd-coin']?.brl;
+      if (typeof rate !== 'number') {
+        throw new Error('Invalid rate payload from upstream');
+      }
+      return rate;
+    } catch (err) {
+      attempt++;
+      if (attempt > retries) throw err;
+      // Exponential backoff
+      await new Promise((res) => setTimeout(res, delayMs * Math.pow(2, attempt - 1)));
+    }
+  }
+  throw new Error('Failed to fetch rate after retries');
+}
+
+export async function getBrlPerUsdc(): Promise<{ rate: number; stale: boolean }> {
+  const now = Date.now();
 
   // Return fresh cache if available
-  if (cache && cache.expires > Date.now()) return cache.value;
-
-  // Cache-stampede guard: share in-flight request across concurrent cold starts
-  if (inflightPromise) {
-    return inflightPromise;
+  if (lastKnownRate && now - lastKnownRate.timestamp < CACHE_TTL_MS) {
+    return { rate: lastKnownRate.rate, stale: false };
   }
 
-  inflightPromise = (async () => {
+  // Singleflight: If a request is already in-flight, await it
+  if (inFlightPromise) {
     try {
-      const value = await fetchCoinGeckoWithRetry();
-      cache = { value, expires: Date.now() + TTL_MS };
-      return value;
-    } catch (error) {
-      console.warn("CoinGecko fetch failed, applying fallback policy:", error);
-      
-      // Fallback 1: Return stale cache if available
-      if (cache) return cache.value;
-
-      // Fallback 2: Hardcoded safe fallback to prevent unhandled throws/500s
-      return FALLBACK_RATE;
-    } finally {
-      inflightPromise = null;
-    }
-  })();
-
-  return inflightPromise;
-}
-
-async function fetchCoinGeckoWithRetry(retries = 2, timeoutMs = 4000): Promise<number> {
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-      const r = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=usd-coin&vs_currencies=brl", {
-        signal: controller.signal,
-      });
-      clearTimeout(timer);
-
-      if (!r.ok) {
-        if (r.status === 429 || r.status >= 500) {
-          throw new Error(`coingecko retryable error ${r.status}`);
-        }
-        throw new Error(`coingecko client error ${r.status}`);
-      }
-
-      const j = await r.json() as { "usd-coin"?: { brl?: number } };
-      const v = j["usd-coin"]?.brl;
-      if (typeof v !== "number" || v <= 0) throw new Error("bad rate response");
-      return v;
-    } catch (err) {
-      if (attempt === retries) throw err;
-      // Exponential backoff delay
-      await new Promise((res) => setTimeout(res, 500 * Math.pow(2, attempt)));
+      const rate = await inFlightPromise;
+      return { rate, stale: false };
+    } catch {
+      // If the shared call failed, fall back below
     }
   }
-  throw new Error("Max retries exceeded");
+
+  // Deduplicate upstream request
+  inFlightPromise = fetchCoinGeckoWithRetry();
+
+  try {
+    const rate = await inFlightPromise;
+    lastKnownRate = { rate, timestamp: Date.now(), stale: false };
+    return { rate, stale: false };
+  } catch (error) {
+    // Fallback strategy: return last known rate or default constant, flagged stale
+    if (lastKnownRate) {
+      return { rate: lastKnownRate.rate, stale: true };
+    }
+    return { rate: DEFAULT_FALLBACK_BRL_PER_USDC, stale: true };
+  } finally {
+    inFlightPromise = null;
+  }
 }
