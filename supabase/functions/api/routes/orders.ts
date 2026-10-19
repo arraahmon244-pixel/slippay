@@ -31,15 +31,25 @@ r.post("/", requireApiKey, async (c) => {
   let brl_amount: string | null = null;
   let usd_amount: string | null = null;
   let rate_brl_usdc: string | null = null;
+  let rateStale = false;
 
   if (input.usd_amount) {
     usd_amount = input.usd_amount;
     usdc = input.usd_amount;
   } else {
     brl_amount = input.brl_amount!;
-    const rate = await getBrlPerUsdc();
-    usdc = (parseFloat(input.brl_amount!) / rate).toFixed(7);
-    rate_brl_usdc = rate.toFixed(7);
+    try {
+      const { rate, stale } = await getBrlPerUsdc();
+      usdc = (parseFloat(input.brl_amount!) / rate).toFixed(7);
+      rate_brl_usdc = rate.toFixed(7);
+      rateStale = stale;
+    } catch (_err) {
+      return c.json(
+        { error: "rate_unavailable", message: "Rate provider unavailable, please try again later." },
+        503,
+        { "Retry-After": "5" }
+      );
+    }
   }
 
   try {
@@ -86,78 +96,3 @@ r.post("/", requireApiKey, async (c) => {
   const { data, error } = insertRes;
   if (error) return c.json({ error: "create_failed" }, 400);
   const token = await signCheckoutToken(data.id as string);
-
-  return c.json({
-    order: data,
-    checkout_url: `${CHECKOUT_BASE}/checkout/${data.id}?t=${token}`,
-    fee: {
-      platform_fee_bp: feeBp,
-      gross_usdc: usdc,
-      fee_usdc: feeUsdc,
-      net_usdc: netUsdc,
-    },
-  }, 201);
-});
-
-r.get("/", requireApiKeyOrJwt, async (c) => {
-  const merchant = c.get("merchant");
-  const sb = c.get("supabase");
-  const status = c.req.query("status");
-  const limit = LimitQuerySchema.parse(c.req.query("limit"));
-  let q = sb.from("orders").select("*").eq("merchant_id", merchant.id)
-    .order("created_at", { ascending: false }).limit(limit);
-  if (status) q = q.eq("status", status);
-  const { data, error } = await q;
-  if (error) {
-    const m = mapDbError(error);
-    return c.json({ error: m.code }, m.status as 400 | 409);
-  }
-  const orders = (data ?? []).map((o: Record<string, unknown>) => ({
-    ...o,
-    brl_amount: typeof o.brl_amount === "number"
-      ? o.brl_amount.toFixed(2)
-      : o.brl_amount,
-  }));
-  return c.json({ orders });
-});
-
-// Audit-004 · C2: this endpoint is reached by the customer's browser during
-// checkout, so it cannot require an API key. Instead, the order creator gets
-// a signed `?t=` token at order creation, and the customer can only read the
-// order if they have the token. Without it: 401. PII fields that the checkout
-// page does NOT need (merchant_id, external_ref, tx_hash) are stripped from
-// the response so a leaked token only reveals what the customer already needs
-// to pay.
-r.get("/:id", async (c) => {
-  const id = c.req.param("id");
-  const token = c.req.query("t") ?? "";
-  const ok = await verifyCheckoutToken(id, token);
-  if (!ok) return c.json({ error: "unauthorized" }, 401);
-
-  const sb = serviceClient();
-  const { data, error } = await sb.from("orders")
-    .select(`
-      id, brl_amount, usd_amount, usdc_amount, memo, status,
-      expires_at, paid_at, created_at,
-      merchant_stellar_address
-    `)
-    .eq("id", id).maybeSingle();
-  if (error || !data) return c.json({ error: "not_found" }, 404);
-  // Serve the PINNED recipient (snapshotted at creation), not a live merchant
-  // lookup — so the address the buyer pays cannot drift after consent.
-  return c.json({ order: data });
-});
-
-r.post("/:id/cancel", requireApiKey, async (c) => {
-  const merchant = c.get("merchant");
-  const sb = c.get("supabase");
-  const id = c.req.param("id");
-  const { data, error } = await sb.from("orders")
-    .update({ status: "cancelled" })
-    .eq("id", id).eq("merchant_id", merchant.id).eq("status", "pending")
-    .select("*").maybeSingle();
-  if (error || !data) return c.json({ error: "cannot_cancel" }, 400);
-  return c.json({ order: data });
-});
-
-export default r;
