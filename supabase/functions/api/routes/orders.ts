@@ -4,7 +4,7 @@ import { CreateOrderInputSchema, UsdcAmountSchema, LimitQuerySchema, ORDER_DEFAU
 import { requireApiKey } from "../middleware/auth_apikey.ts";
 import { requireApiKeyOrJwt } from "../middleware/auth_any.ts";
 import { generateMemo } from "../lib/memo.ts";
-import { getBrlPerUsdc } from "../lib/rate.ts";
+import { getBrlPerUsdc, RateUnavailableError } from "../lib/rate.ts";
 import { serviceClient } from "../lib/supabase.ts";
 import { signCheckoutToken, verifyCheckoutToken } from "../lib/checkout-token.ts";
 import { mapDbError } from "../lib/db-error.ts";
@@ -37,7 +37,22 @@ r.post("/", requireApiKey, async (c) => {
     usdc = input.usd_amount;
   } else {
     brl_amount = input.brl_amount!;
-    const rate = await getBrlPerUsdc();
+    let rate: number;
+    try {
+      rate = await getBrlPerUsdc();
+    } catch (error) {
+      if (error instanceof RateUnavailableError) {
+        return c.json(
+          {
+            error: "service_unavailable",
+            detail: "BRL/USDC exchange rate is temporarily unavailable. Please retry.",
+          },
+          503,
+          { "Retry-After": "5" },
+        );
+      }
+      throw error;
+    }
     usdc = (parseFloat(input.brl_amount!) / rate).toFixed(7);
     rate_brl_usdc = rate.toFixed(7);
   }
